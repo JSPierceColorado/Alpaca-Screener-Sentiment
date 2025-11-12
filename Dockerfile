@@ -1,16 +1,18 @@
 FROM python:3.12-slim
 
-# Install system deps (if you need more later, add them here)
+# Install basic system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt ./
+# Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy app
 COPY . .
 
-# Run the job once and exit
+# Run once and exit (Railway Cron will restart container per schedule)
 CMD ["python", "main.py"]
