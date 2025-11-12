@@ -11,18 +11,21 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------- Config via environment ----------
 
-# Name of the sheet and worksheet; defaults to what you asked for
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
 WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Alpaca-Screener")
 
-# Polygon / Massive API key (they rebranded but key still works)
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY") or os.getenv("MASSIVE_API_KEY")
+# Alpaca market data credentials (same keys you use for trading)
+APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 
-# Google creds JSON (same pattern as your other bot)
+# Google service account JSON (full JSON as one line)
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
+# Optional cap so a single run doesn't go forever if you have tons of tickers
+MAX_TICKERS_PER_RUN = int(os.getenv("MAX_TICKERS_PER_RUN", "100"))
 
-# ---------- Helpers ----------
+
+# ---------- Google Sheets helpers ----------
 
 def get_gspread_client() -> gspread.Client:
     if not GOOGLE_CREDS_JSON:
@@ -38,56 +41,84 @@ def get_gspread_client() -> gspread.Client:
     return client
 
 
-def fetch_news_headlines_for_ticker(ticker: str, limit: int = 20) -> List[str]:
-    """
-    Fetch recent news headlines for a ticker using Polygon/Massive News v2 API.
-
-    Returns a list of strings (titles). If there's an error or no results,
-    returns an empty list.
-    """
-    if not POLYGON_API_KEY:
-        print("POLYGON_API_KEY / MASSIVE_API_KEY not configured; skipping news for", ticker)
-        return []
-
-    url = "https://api.polygon.io/v2/reference/news"
-    params = {
-        "ticker": ticker,
-        "limit": limit,
-        "apiKey": POLYGON_API_KEY,
-    }
-
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", []) or []
-        headlines = []
-
-        for article in results:
-            title = article.get("title")
-            if title:
-                headlines.append(title)
-
-        return headlines
-    except Exception as e:
-        print(f"Error fetching news for {ticker}: {e}")
-        return []
-
+# ---------- Alpaca news + sentiment ----------
 
 analyzer = SentimentIntensityAnalyzer()
 
 
-def analyze_sentiment(headlines: List[str]) -> Tuple[Optional[float], int]:
+def fetch_news_texts_for_ticker(ticker: str, limit: int = 20) -> List[str]:
     """
-    Given a list of headlines, compute average VADER compound sentiment.
-    Returns (average_compound, article_count). If no headlines, returns (None, 0).
+    Fetch recent news for a ticker from Alpaca's /v1beta1/news endpoint,
+    and return a list of text snippets (headline + summary) for sentiment.
+
+    If keys are missing or the request fails, returns an empty list.
     """
-    if not headlines:
+    if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+        print("Alpaca API keys not configured; skipping news for", ticker)
+        return []
+
+    url = "https://data.alpaca.markets/v1beta1/news"
+    params = {
+        "symbols": ticker,
+        "limit": min(limit, 20),  # plenty for sentiment
+    }
+    headers = {
+        "APCA-API-KEY-ID": APCA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+        "accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+
+        # Common case if news access isn't allowed on the plan
+        if resp.status_code == 403:
+            print(f"Alpaca news not permitted for subscription (ticker {ticker}).")
+            return []
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Response can be either a list or an object containing a list
+        # Be defensive about structure.
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # Some variants use keys like 'news' or 'data'
+            items = data.get("news") or data.get("data") or []
+        else:
+            items = []
+
+        texts: List[str] = []
+        for article in items:
+            if not isinstance(article, dict):
+                continue
+            headline = article.get("headline") or article.get("title") or ""
+            summary = article.get("summary") or ""
+            if headline:
+                if summary:
+                    texts.append(f"{headline}. {summary}")
+                else:
+                    texts.append(headline)
+
+        return texts
+
+    except Exception as e:
+        print(f"Error fetching Alpaca news for {ticker}: {e}")
+        return []
+
+
+def analyze_sentiment(texts: List[str]) -> Tuple[Optional[float], int]:
+    """
+    Given a list of text snippets, compute average VADER compound sentiment.
+    Returns (average_compound, count). If no texts, returns (None, 0).
+    """
+    if not texts:
         return None, 0
 
     scores = []
-    for h in headlines:
-        vs = analyzer.polarity_scores(h)
+    for t in texts:
+        vs = analyzer.polarity_scores(t)
         scores.append(vs["compound"])
 
     if not scores:
@@ -97,32 +128,32 @@ def analyze_sentiment(headlines: List[str]) -> Tuple[Optional[float], int]:
     return avg_compound, len(scores)
 
 
+# ---------- Main processing ----------
+
 def process_sheet_once():
-    # Connect to Google Sheet
+    # Connect to Google Sheets
     client = get_gspread_client()
     sheet = client.open(SHEET_NAME)
     ws = sheet.worksheet(WORKSHEET_NAME)
 
-    # Read all tickers from column A
-    # col_values(1) returns a list like ["Ticker", "AAPL", "MSFT", ...]
+    # Column A values: ["Ticker", "AAPL", "MSFT", ...]
     col_a_values = ws.col_values(1)
     if not col_a_values or len(col_a_values) <= 1:
         print("No tickers found in column A (beyond header). Nothing to do.")
         return
 
-    # Row 1 = header; start at row 2
-    tickers = col_a_values[1:]  # skip header
+    # Row 1 is header; use rows 2..N
+    tickers = col_a_values[1:]  # raw strings including blanks
+    if MAX_TICKERS_PER_RUN > 0:
+        tickers = tickers[:MAX_TICKERS_PER_RUN]
+
     start_row = 2
     end_row = start_row + len(tickers) - 1
 
-    print(f"Found {len(tickers)} tickers in column A (rows {start_row}-{end_row}).")
+    print(f"Found {len(tickers)} tickers to process in column A (rows {start_row}-{end_row}).")
 
-    # Prepare rows for Q–S (columns 17–19)
-    # Q: avg sentiment (float)
-    # R: number of articles used
-    # S: timestamp UTC of calculation
     now_utc = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    rows_q_to_s = []
+    rows_q_to_s: List[List[Optional[object]]] = []
 
     for idx, raw_ticker in enumerate(tickers):
         row_number = start_row + idx
@@ -130,27 +161,25 @@ def process_sheet_once():
 
         if not ticker:
             print(f"Row {row_number}: empty ticker, skipping.")
-            rows_q_to_s.append(["", "", ""])  # keep alignment
+            rows_q_to_s.append(["", "", ""])
             continue
 
         print(f"Row {row_number}: processing ticker {ticker}")
 
-        headlines = fetch_news_headlines_for_ticker(ticker)
-        avg_sentiment, article_count = analyze_sentiment(headlines)
+        texts = fetch_news_texts_for_ticker(ticker)
+        avg_sentiment, count = analyze_sentiment(texts)
 
         if avg_sentiment is None:
-            print(f"  No news headlines found for {ticker}.")
+            print(f"  No usable news for {ticker}. Leaving cells blank.")
             rows_q_to_s.append(["", "", ""])
             continue
 
-        print(f"  Avg sentiment: {avg_sentiment:.4f} based on {article_count} articles.")
+        print(f"  Avg sentiment: {avg_sentiment:.4f} from {count} articles.")
+        rows_q_to_s.append([avg_sentiment, count, now_utc])
 
-        rows_q_to_s.append([avg_sentiment, article_count, now_utc])
-
-    # Batch update Q–S for all rows at once
-    # Column Q is 17, so Q2:S{end_row}
+    # Batch update Q–S for all processed rows
     range_q_to_s = f"Q{start_row}:S{end_row}"
-    print(f"Updating range {range_q_to_s}...")
+    print(f"Updating range {range_q_to_s} in worksheet '{WORKSHEET_NAME}' of '{SHEET_NAME}'...")
     ws.update(range_q_to_s, rows_q_to_s, value_input_option="RAW")
 
     print("Done. Exiting.")
