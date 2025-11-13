@@ -1,6 +1,7 @@
 import os
 import json
 import datetime
+import time
 from typing import List, Tuple, Optional
 
 import requests
@@ -21,8 +22,16 @@ APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 # Google service account JSON (full JSON as one line)
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
-# Optional cap so a single run doesn't go forever if you have tons of tickers
-MAX_TICKERS_PER_RUN = int(os.getenv("MAX_TICKERS_PER_RUN", "100"))
+# Optional cap so a single run doesn't go forever if you have tons of tickers.
+# 0 means "no limit, process all tickers".
+MAX_TICKERS_PER_RUN = int(os.getenv("MAX_TICKERS_PER_RUN", "0"))
+
+# --- Simple rate limiting for Alpaca News ---
+# Default ~120 req/min (0.5s spacing). You can lower this via env var if needed.
+ALPACA_NEWS_REQS_PER_MINUTE = float(os.getenv("ALPACA_NEWS_REQS_PER_MINUTE", "120"))
+ALPACA_NEWS_MIN_DELAY = 60.0 / ALPACA_NEWS_REQS_PER_MINUTE
+
+_last_news_call_time = 0.0
 
 
 # ---------- Google Sheets helpers ----------
@@ -51,16 +60,24 @@ def fetch_news_texts_for_ticker(ticker: str, limit: int = 20) -> List[str]:
     Fetch recent news for a ticker from Alpaca's /v1beta1/news endpoint,
     and return a list of text snippets (headline + summary) for sentiment.
 
-    If keys are missing or the request fails, returns an empty list.
+    Includes simple client-side rate limiting and one retry on 429.
     """
+    global _last_news_call_time
+
     if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
         print("Alpaca API keys not configured; skipping news for", ticker)
         return []
 
+    # --- simple pacing between calls ---
+    now = time.time()
+    elapsed = now - _last_news_call_time
+    if elapsed < ALPACA_NEWS_MIN_DELAY:
+        time.sleep(ALPACA_NEWS_MIN_DELAY - elapsed)
+
     url = "https://data.alpaca.markets/v1beta1/news"
     params = {
         "symbols": ticker,
-        "limit": min(limit, 20),  # plenty for sentiment
+        "limit": min(limit, 20),
     }
     headers = {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
@@ -68,23 +85,48 @@ def fetch_news_texts_for_ticker(ticker: str, limit: int = 20) -> List[str]:
         "accept": "application/json",
     }
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+    def do_request(tag: str):
+        """Inner helper to log which attempt we're on."""
+        global _last_news_call_time
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            _last_news_call_time = time.time()
+            return resp
+        except Exception as e:
+            print(f"Error during {tag} request for {ticker}: {e}")
+            raise
 
-        # Common case if news access isn't allowed on the plan
-        if resp.status_code == 403:
-            print(f"Alpaca news not permitted for subscription (ticker {ticker}).")
-            return []
+    try:
+        # First attempt
+        resp = do_request("initial")
+
+        # If rate-limited, wait and retry once
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    wait_s = int(retry_after)
+                except ValueError:
+                    wait_s = 10
+            else:
+                wait_s = 10
+
+            print(f"Hit Alpaca news rate limit for {ticker}. Waiting {wait_s}s then retrying once...")
+            time.sleep(wait_s)
+
+            resp = do_request("retry")
+
+            if resp.status_code == 429:
+                print(f"Still rate limited for {ticker} after retry. Skipping.")
+                return []
 
         resp.raise_for_status()
         data = resp.json()
 
-        # Response can be either a list or an object containing a list
-        # Be defensive about structure.
+        # Response can be list or { "news": [...] } style
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            # Some variants use keys like 'news' or 'data'
             items = data.get("news") or data.get("data") or []
         else:
             items = []
@@ -103,6 +145,9 @@ def fetch_news_texts_for_ticker(ticker: str, limit: int = 20) -> List[str]:
 
         return texts
 
+    except requests.HTTPError as e:
+        print(f"HTTP error fetching Alpaca news for {ticker}: {e}")
+        return []
     except Exception as e:
         print(f"Error fetching Alpaca news for {ticker}: {e}")
         return []
@@ -144,6 +189,8 @@ def process_sheet_once():
 
     # Row 1 is header; use rows 2..N
     tickers = col_a_values[1:]  # raw strings including blanks
+
+    # Optional per-run cap
     if MAX_TICKERS_PER_RUN > 0:
         tickers = tickers[:MAX_TICKERS_PER_RUN]
 
@@ -152,7 +199,9 @@ def process_sheet_once():
 
     print(f"Found {len(tickers)} tickers to process in column A (rows {start_row}-{end_row}).")
 
-    now_utc = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    # Proper UTC timestamp, timezone-aware
+    now_utc = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+
     rows_q_to_s: List[List[Optional[object]]] = []
 
     for idx, raw_ticker in enumerate(tickers):
